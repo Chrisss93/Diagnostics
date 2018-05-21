@@ -1,1 +1,1 @@
-Diagnostics
+A shiny app for creating networks of symptoms and medical conditions.
