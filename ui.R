@@ -21,15 +21,15 @@ body <- dashboardBody(
 	tabItems(
 		tabItem(tabName = "dashboard",
 			fluidRow(
-				box(uiOutput("symptomSelect"), title = "Symptoms", status = "primary", solidHeader = TRUE),
-				box(title = "Possible conditions", status = "primary", solidHeader = TRUE,
+				box(uiOutput("symptomSelect"), title = "Symptoms", status = "primary"),
+				box(title = "Possible conditions", status = "primary",
 					conditionalPanel("input.symptoms != null",
 						span(style = sbs_style, tableOutput("conditionSelect")),
 						span(style = sbs_style, circleButton("help", icon("question"), "info", size = "xs"))
 					)
 			)),
 			fluidRow(
-				box(visNetworkOutput("net"), title = "Symptom network", status = "success", width = 12, 
+				box(visNetwork::visNetworkOutput("net"), title = "Symptom network", status = "success", width = 12, 
 					solidHeader = TRUE, collapsible = TRUE))
 		),
 		tabItem(tabName = "database",
@@ -50,9 +50,12 @@ body <- dashboardBody(
 							uiOutput("addButton")),
 						conditionalPanel("input.editAction == 'delete'",
 							uiOutput("deleteMenu"),
-							actionButton("deleteButton", "Delete", icon("fa-trash"))),
+							actionButton("deleteButton", "Delete", icon("trash"))),
 						conditionalPanel("input.editAction == 'change'", 
-							p("Not finished yet."))
+							uiOutput("changeMenu"),
+							uiOutput("changeAdd"),
+							visNetwork::visNetworkOutput("changeVis"),
+							actionButton("changeButton", "Save", icon("save")))
 					)
 				)
 			)
