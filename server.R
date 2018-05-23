@@ -10,10 +10,10 @@ library(dplyr)
 options(stringsAsFactors = FALSE)
 cred <- list(
 	drv      = RMariaDB::MariaDB(), 
-	user     = Sys.getenv("diagUser"), 
-	password = Sys.getenv("diagPwd"), 
-	db       = Sys.getenv("diagDb"))
-
+	host     = Sys.getenv("DIAGNOSTIC_SQL_HOST"),
+	user     = Sys.getenv("DIAGNOSTIC_SQL_USER"), 
+	password = Sys.getenv("DIAGNOSTIC_SQL_PWD"), 
+	db       = Sys.getenv("DIAGNOSTIC_SQL_DB"))
 single     <- function(x) gsub("(?<!s)s$", "", x, perl = TRUE)
 quickNames <- function(x, val, op) names(sort(x[op(x, val)]))
 visBoiler  <- function(x, frozen = TRUE, ord = TRUE) {
@@ -285,6 +285,7 @@ server <- function(input, output, session) {
 	# selecting nodes and adding edges but there's only so much visNetwork lets me customize the HTML. 
 	# Will return to this later to take advantage of visOptions(), but for now will do my own janky node/edge editing
 	observeEvent(input$changeLinks, {
+		if (is.null(input$changeLinks)) { react_val$changeVisReset <- react_val$changeVisReset + 1}
 		react_val$dbAddLog <- append(react_val$dbAddLog, input$changeLinks)
 		
 		nodes <- data.frame(
@@ -346,6 +347,11 @@ server <- function(input, output, session) {
 		}
 		react_val$dbAddLog <- react_val$dbDelLog <- NULL
 		react_val$changeVisReset <- react_val$changeVisReset + 1
+	})
+	
+	observeEvent(input$changeCancel, {
+		react_val$dbAddLog <- react_val$dbDelog <- NULL
+		react_val$changeVisReset <- react_val$changeVisRest  + 1
 	})
 
 	#########################

@@ -3,7 +3,8 @@ library(shinydashboard)
 library(shinyWidgets)
 
 sidebar <- dashboardSidebar(
-	uiOutput("userpanel"),
+	sidebarUserPanel(paste("Logged in as:", USER$name),
+		subtitle = a(icon("sign-out"), "Logout", href = Sys.getenv("DIAGNOSTIC_AUTH0_LOGOUT"))),
 	sidebarMenu(
 		menuItem("Dashboard", tabName = "dashboard", icon = icon("dashboard"), badgeLabel = "new", badgeColor = "green"),
 		menuItem("Edit database", tabName = "database", icon = icon("database"), badgeLabel = "new", badgeColor = "green"),
@@ -55,7 +56,9 @@ body <- dashboardBody(
 							uiOutput("changeMenu"),
 							uiOutput("changeAdd"),
 							visNetwork::visNetworkOutput("changeVis"),
-							actionButton("changeButton", "Save", icon("save")))
+							div(actionButton("changeCancel", "Cancel", icon("times")), 
+								actionButton("changeButton", "Save", icon("save")))
+							)
 					)
 				)
 			)
