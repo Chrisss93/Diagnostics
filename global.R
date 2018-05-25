@@ -8,10 +8,11 @@ library(httr)
 keenUser <- function() {
 	Sys.sleep(5) # Allow time for KeenIO to register data-stream from Auth0
 	keen_req <- GET(
-		url = paste("https://api.keen.io/3.0", Sys.getenv("DIAGNOSTIC_KEEN_PROJECT_ID"), "queries/saved",
+		url = paste("https://api.keen.io/3.0/projects", Sys.getenv("DIAGNOSTIC_KEEN_PROJECT_ID"), "queries/saved",
 					tolower(Sys.getenv("DIAGNOSTIC_KEEN_QUERY")), "result", sep = "/"),
 		add_headers("Authorization" = Sys.getenv("DIAGNOSTIC_KEEN_READKEY"), "Content-Type" = "application/json")
 	)
+	print(keen_req$all_headers)
 	res <- content(keen_req)[["result"]]
 	if ( length(res) < 1) {
 		res$name <- sQuote("Unknown")
