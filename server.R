@@ -265,16 +265,18 @@ server <- function(input, output, session) {
 			" WHERE {`mainField`} = {val}", 
 			mainField = typeFields()[1], otherField = typeFields()[2], val = as.numeric(input$changeEntity), .con = db)
 		dta <- dbGetQuery(db, query)
-		nodes <- bind_rows(
-			data.frame(
-				id    = as.numeric(input$changeEntity), 
-				label = quickNames(STATES()[[input$editType]], as.numeric(input$changeEntity), `==`),
-				group = input$editType),
-			data.frame(
-				id    = dta$to,
-				label = dta$name,
-				group = otherType())
-		)
+		
+		nodes <- data.frame(
+			id    = as.numeric(input$changeEntity), 
+			label = quickNames(STATES()[[input$editType]], as.numeric(input$changeEntity), `==`),
+			group = input$editType)
+		if (nrow(dta) > 0) {
+			nodes <- bind_rows(nodes, 
+				data.frame(
+					id    = dta$to,
+					label = dta$name,
+					group = otherType()))
+		} 
 		visNetwork(nodes, dta) %>% 
 			# visOptions(nodesIdSelection = list(enabled = TRUE, style = "width: 400px; display: none"), 
 			# 	manipulation = TRUE) %>% 
@@ -337,7 +339,7 @@ server <- function(input, output, session) {
 			}
 			if (length(react_val$dbAddLog) > 0) {
 				dta <- data.frame(as.numeric(input$changeEntity), react_val$dbAddLog)
-				names(dta) <- typeFields
+				names(dta) <- typeFields()
 				dbWriteTable(db, "diagnosis", dta, append = TRUE)
 			}
 			idx <- react_val[["dbChanged"]]$Action == "change" & react_val[["dbChanged"]]$Entity == input$editType
@@ -377,8 +379,8 @@ server <- function(input, output, session) {
 			" LEFT JOIN diagnosis ON id = conditionId",
 			" WHERE userId = {user} AND conditionId IS NULL", user = USER$id, .con = db))
 		msgs <- list(
-			taskItem("Register at least 15 conditions",        round(100 * total_s / 15), color = "red"),
-			taskItem("Register at least 30 symptoms",          round(100 * total_c / 30), color = "aqua"),
+			taskItem("Register at least 15 conditions",        round(100 * total_c / 15), color = "red"),
+			taskItem("Register at least 30 symptoms",          round(100 * total_s / 30), color = "aqua"),
 			taskItem("All conditions have a symptom",          100 - round(100 * bad_c$c / total_c), color = "yellow"),
 			taskItem("All symptoms are linked to a condition", 100 - round(100 * bad_s$c / total_s), color = "blue")
 		)

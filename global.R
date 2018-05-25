@@ -17,7 +17,7 @@ keenUser <- function() {
 	if ( length(res) < 1) {
 		res$name <- sQuote("Unknown")
 		res$group <- "guest"
-		res$id    <- 0
+		res$id    <- "00GUEST"
 	} else if ( length(res) > 1) {
 		timestamp <- strptime( sapply(res, function(x) x$keen$timestamp), "%Y-%m-%dT%H:%M:%OSZ")
 		res <- res[[ which(timestamp == min(timestamp)) ]]
