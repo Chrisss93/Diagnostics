@@ -4,7 +4,8 @@ library(DBI)
 library(visNetwork)
 library(dplyr)
 # TODO: Disconnect database better...consider switching to `pool`?
-# TODO: Play better with Auth0 authentication
+# TODO: Call keenIO user-info API asynchronously (needs a Sys.sleep call to wait on KeenIO) with `future`, `promises`
+#		Or if that is complicated, in the add shinyjs loading screen in the meantime.
 # TODO: Dynamic focus. 
 # TODO: Consider switching network visualization to `igraph`. Don't like how vis.js looks right now
 options(stringsAsFactors = FALSE)
@@ -15,7 +16,7 @@ cred <- list(
 	password = Sys.getenv("DIAGNOSTIC_SQL_PWD"), 
 	db       = Sys.getenv("DIAGNOSTIC_SQL_DB"))
 single     <- function(x) gsub("(?<!s)s$", "", x, perl = TRUE)
-quickNames <- function(x, val, op) names(sort(x[op(x, val)]))
+quickNames <- function(x, val, op) names(x[op(x, val)])
 visBoiler  <- function(x, frozen = TRUE, ord = TRUE) {
 	hfunc <- if (ord) visHierarchicalLayout else identity
 	ffunc <- if (frozen) function(x) visInteraction(x, dragNodes = FALSE, dragView = FALSE, zoomView = FALSE) 
@@ -25,8 +26,10 @@ visBoiler  <- function(x, frozen = TRUE, ord = TRUE) {
 		visEdges(color = "black") %>% 
 		visNodes(font = list(size = 20))
 }
+import::from("glue", "glue_sql")
 
 server <- function(input, output, session) {
+	USER <- keenUser()
 	db <- do.call("dbConnect", cred)
 	session$onSessionEnded( function() { dbDisconnect(db); print("Database connection terminated.") } )
 	
@@ -34,6 +37,7 @@ server <- function(input, output, session) {
 	# the write-observers. The most elegant way I can think of doing this is to make the connection object
 	# itself a reactive value. Works well, saves me boilerplate code, but final issue is how to disconnect?
 	# onSessionEnded wouldn't work because the reactive connection object must be called in a reactive context. hmm...
+	# isolate() ?
 	react_val <- reactiveValues(
 		dbChanged = expand.grid(Action = EDIT_FIELDS, Entity = ENTITY_FIELDS, Edits = 0, stringsAsFactors = FALSE),
 		dbTrigger = 0,
@@ -46,34 +50,46 @@ server <- function(input, output, session) {
 		react_val$dbTrigger <- react_val$dbTrigger + 1
 	})
 
-	ENTITIES <- eventReactive(react_val$dbTrigger, {
-		symptom   <- dbGetQuery(db, "SELECT id, name FROM symptoms")
-		condition <- dbGetQuery(db, "SELECT id, name FROM conditions")
-
-		setNames(nm = ENTITY_FIELDS, list(setNames(symptom$id, symptom$name), setNames(condition$id, condition$name)))
+	STATES <- eventReactive(react_val$dbTrigger, {
+		dta <- dbGetQuery(db, glue_sql("SELECT id, name, type FROM states WHERE userId = {user}", user = USER$id,
+									   .con = db))
+		
+		labels  <- setNames(nm = ENTITY_FIELDS, 
+			list(setNames(dta$id[dta$type == "symptom"], dta$name[dta$type == "symptom"]),
+				setNames(dta$id[dta$type == "condition"], dta$name[dta$type == "condition"]))
+		)
+		attr(labels, "data") <- dta
+		labels
 	})
-	otherTable <- reactive( setdiff(ENTITY_FIELDS, input$editTable) )
+	otherType <- reactive( setdiff(ENTITY_FIELDS, input$editType) )
+	typeFields <- reactive({
+		if (input$editType == "symptoms") {
+			func <- identity
+		} else {
+			func <- rev
+		}
+		func(c("symptomId", "conditionId"))
+	})
 	
 	#########################
 	# Dashboard
 	#########################
 	# 1. Symptom-condition look-up
 	output$symptomSelect <- renderUI({
-		pickerInput("symptoms", NULL, ENTITIES()[["symptoms"]], multiple = TRUE, 
+		pickerInput("symptoms", NULL, STATES()[["symptoms"]], multiple = TRUE, 
 			options = list("live-search" = TRUE, "actions-box" = TRUE, "none-selected-text" = "Enter symptoms here"))
 	})
 	
 	diagnosis <- eventReactive(input$symptoms, {
-		# TODO: Rewrite this disaster of a query!
-		query <- glue::glue_sql(paste(
-			"SELECT sc.*, c.name AS conditions, s.name AS symptom, s.id IN ({vals*}) AS symptomPresent", 
-			"FROM symptomCondition sc", 
-			"LEFT JOIN conditions c ON sc.conditionId = c.id", 
-			"LEFT JOIN symptoms s ON sc.symptomId = s.id", 
-			"WHERE conditionId IN (", 
-				"SELECT conditionId FROM symptomCondition", 
-				"LEFT JOIN symptoms ON symptomId = id", 
-				"WHERE id IN ({vals*}))"), vals = as.numeric(input$symptoms), .con = db)
+		query <- glue_sql(
+			"SELECT d.*, s.name AS symptoms, c.name AS conditions, d.symptomId IN ({symp*}) AS symptomPresent", 
+			" FROM diagnosis d", 
+			" INNER JOIN states s ON s.id = d.symptomId",
+			" INNER JOIN states c ON c.id = d.conditionId",
+			" WHERE s.userId = {user} AND conditionId IN (",
+				" SELECT conditionId FROM diagnosis WHERE symptomId IN ({symp*}))", 
+			user = USER$id, symp = as.numeric(input$symptoms), .con = db)
+		
 		dbGetQuery(db, query)
 	})
 	
@@ -89,16 +105,12 @@ server <- function(input, output, session) {
 	})
 	# 2. Symptom-condition network analysis
 	output$net <- renderVisNetwork({
-		nodes <- bind_rows(
-			diagnosis() %>% 
-				transmute(id = paste0(symptomId, "S"), group = as.character(symptomPresent), label = symptom) %>% 
-				distinct(),
-			diagnosis() %>% 
-				transmute(id = paste0(conditionId, "C"), group = "2", label = conditions) %>% 
-				distinct()
+		nodes <- data.frame(
+			id    = c(diagnosis()$symptomId, diagnosis()$conditionId),
+			label = c(diagnosis()$symptoms, diagnosis()$conditions),
+			group = as.numeric(c(diagnosis()$symptomPresent, rep(2, nrow(diagnosis()))))
 		)
-		edges <- transmute(diagnosis(), from = paste0(conditionId, "C"), to = paste0(symptomId, "S"))
-		visNetwork(mutate(nodes, level = group != "2"), edges, arrows = "from") %>%
+		visNetwork(distinct(nodes), select(diagnosis(), from = conditionId, to = symptomId), arrows = "from") %>%
 			visBoiler(frozen = FALSE, ord = FALSE) %>% 
 			visGroups(groupname = "1", color = "#39CCCC") %>%
 			visGroups(groupname = "0", color = "grey") %>%
@@ -108,12 +120,16 @@ server <- function(input, output, session) {
 	# Edit Database
 	#########################
 	# Probably want to ditch this as the database grows, but I dunno how much data transparency is wanted
-	output$dbSymptom   <- DT::renderDataTable({ react_val$dbTrigger; dbReadTable(db, "symptoms") }, rownames = FALSE)
-	output$dbCondition <- DT::renderDataTable({ react_val$dbTrigger; dbReadTable(db, "conditions") }, rownames = FALSE)
+	output$dbSymptom   <- DT::renderDataTable({ react_val$dbTrigger
+		filter(attr(STATES(), "data"), type == "symptom") %>% select(-type)
+	}, rownames = FALSE)
+	output$dbCondition <- DT::renderDataTable({ react_val$dbTrigger
+		filter(attr(STATES(), "data"), type == "condition") %>% select(-type) 
+	}, rownames = FALSE)
 	
 	# 1. Adding
 	output$addEntity <- renderUI({
-		searchInput("addEntity", btnSearch = icon("search"), paste("Add", single(input$editTable)))
+		textInput("addEntity", paste("Add", single(input$editType)))
 	})
 	
 	observeEvent(input$addEntity, {
@@ -122,11 +138,11 @@ server <- function(input, output, session) {
 		output$addButton <- renderUI( actionButton("addButton", "Add", icon("plus")) )
 		
 		output$addMenu <- renderUI({ 
-			selectizeInput("addLinks", multiple = TRUE, choices = ENTITIES()[[ otherTable() ]],
-				label = paste("Associated", otherTable()))
+			selectizeInput("addLinks", multiple = TRUE, choices = STATES()[[ otherType() ]],
+				label = paste("Associated", otherType()))
 		})
 
-		lev <- as.numeric(adist(input$addEntity, names( ENTITIES()[[ input$editTable ]] ), ignore.case = TRUE))
+		lev <- as.numeric(adist(input$addEntity, names( STATES()[[ input$editType ]] ), ignore.case = TRUE))
 
 		if (any(lev == 0)) {
 			sendSweetAlert(session, "Error", paste(input$addEntity, "already exists!"), type = "error")
@@ -134,8 +150,8 @@ server <- function(input, output, session) {
 		} else if (any(lev < 2)) {
 			confirmSweetAlert(session, "addConfirm", "Warning", type = "warning", 
 				btn_labels = c("Cancel", "Continue anyways"),
-				paste0("This new ", single(input$editTable), " is similar to existing ", input$editTable), ": ", 
-					paste(sQuote(names( ENTITIES()[[ otherTable() ]] )[lev == 1]), collapse = ", "))
+				paste0("This new ", single(input$editType), " is similar to existing ", input$editType), ": ", 
+					paste(sQuote(names( STATES()[[ otherType() ]] )[lev == 1]), collapse = ", "))
 		}
 	})
 	observeEvent(input$addConfirm, {
@@ -149,24 +165,23 @@ server <- function(input, output, session) {
 			need(nchar(input$addEntity) > 1, "Must be a real entity name")
 		)
 		rs <- tryCatch(
-			dbWriteTable(db, input$editTable, data.frame(name = input$addEntity), append = TRUE),
+			dbWriteTable(db, "states", append = TRUE,
+				data.frame(name = input$addEntity, type = single(input$editType), userId = USER$id)),
 			error = function(e) {
 				sendSweetAlert(session, "Oops", "Unable to add entries. Contact for help.", type = "error")
 		})
-		title <- paste(capitalize(single(input$editTable)), "added!")
+		title <- paste(capitalize(single(input$editType)), "added!")
 		
 		if (!is.null(input$addLinks) && nchar(input$addLinks) > 0) {
-			query  <- glue::glue_sql("SELECT id FROM {`tab`} WHERE name = {val}", tab = input$editTable, 
-				val = input$addEntity, .con = db)
+			query  <- glue_sql("SELECT id FROM states WHERE name = {nm} AND userId = {user}", 
+				nm = input$addEntity, user = USER$id, .con = db)
 			add_id <- dbGetQuery(db, query)[["id"]]
 			dta    <- expand.grid(symptomId = add_id, conditionId = as.numeric(input$addLinks))
-			prefix <- c("S", "C")
-			
-			if (input$editTable == "conditions") {
+
+			if (input$editType == "conditions") {
 				names(dta) <- rev(names(dta))
-				prefix     <- rev(prefix)
 			}
-			rs_links <- tryCatch(dbWriteTable(db, "symptomCondition", dta, append = TRUE),
+			rs_links <- tryCatch(dbWriteTable(db, "diagnosis", dta, append = TRUE),
 				error = function(e) {
 					sendSweetAlert(session, "Oops", "Unable to add entry links. Contact for help.", type = "error")
 			})
@@ -174,12 +189,11 @@ server <- function(input, output, session) {
 				tags$style(".swal-modal {width: 50%;}"),
 				renderVisNetwork({
 					nodes <- data.frame(
-						id    = c( paste0(add_id, prefix[1]), paste0(sort(dta[, 2]), prefix[2]) ),
-						label = c( input$addEntity, quickNames(ENTITIES()[[ otherTable() ]], dta[, 2], `%in%`) ),
-						group = c( input$editTable, rep(otherTable(), nrow(dta)) )
+						id    = c( add_id, dta[, 2]),
+						label = c( input$addEntity, quickNames(STATES()[[ otherType() ]], dta[, 2], `%in%`) ),
+						group = c( input$editType, rep(otherType(), nrow(dta)) )
 					)
-					edges <- mutate(dta, symptomId = paste0(symptomId, "S"), conditionId = paste0(conditionId, "C"))
-					visNetwork(nodes, setNames(edges, c("from", "to"))) %>% 
+					visNetwork(nodes, setNames(dta, c("from", "to"))) %>% 
 						visBoiler() %>%
 						visGroups(groupname = "symptoms", color = "#39CCCC") %>%
 						visGroups(groupname = "conditions", shape = "icon",
@@ -188,88 +202,79 @@ server <- function(input, output, session) {
 				})
 			))
 		} else {
-			sendSweetAlert(session, title, type = "success", text = paste("But not associated with any", otherTable()))
+			sendSweetAlert(session, title, type = "success", text = paste("But not associated with any", otherType()))
 		}
-		idx <- react_val[["dbChanged"]]$Action == "add" & react_val[["dbChanged"]]$Entity == input$editTable
+		idx <- react_val[["dbChanged"]]$Action == "add" & react_val[["dbChanged"]]$Entity == input$editType
 		react_val[["dbChanged"]]$Edits[idx] <- react_val[["dbChanged"]]$Edits[idx] + rs
 	})
 
 	
 	# 2. Deletion
 	output$deleteMenu <- renderUI({
-		selectizeInput("deleteEntity", choices = ENTITIES()[[input$editTable]], multiple = TRUE,
-			label = paste("Select", input$editTable))
+		selectizeInput("deleteEntity", choices = STATES()[[input$editType]], multiple = TRUE,
+			label = paste("Select", input$editType))
 	})
 	observeEvent(input$deleteButton, {
-		del_name <- quickNames(ENTITIES()[[input$editTable]], as.numeric(input$deleteEntity), `==`)
+		del_name <- quickNames(STATES()[[input$editType]], as.numeric(input$deleteEntity), `==`)
 
 		if ( length(input$deleteEntity) > 0) {
 			confirmSweetAlert(session, "deleteConfirm", type = "warning", html = TRUE,
-				paste0("Are you sure you want to delete these ", input$editTable, "?"),
+				paste0("Are you sure you want to delete these ", input$editType, "?"),
 				tags$ul(style = "text-align: left", lapply(del_name, tags$li)))
 		}
 	})
 	observeEvent(input$deleteConfirm, {
 		validate(need(input$deleteConfirm, "User must confirm deletion"))
 
-		query <- glue::glue_sql("DELETE FROM {`tab`} WHERE id IN ({vals*})",
-			tab = input$editTable, vals = as.numeric(input$deleteEntity), .con = db)
+		query <- glue_sql("DELETE FROM states WHERE userId = {user} AND id IN ({vals*})",
+			user = USER$id, vals = as.numeric(input$deleteEntity), .con = db)
 		
 		rs <- tryCatch(dbExecute(db, query), error = function(e) {
 			sendSweetAlert(session, "Oops", "Unable to delete entries. Contact for help.", type = "error")
 		})
 
-		query <- glue::glue_sql("DELETE FROM symptomCondition WHERE {`field`} IN ({vals*})",
-			field = ifelse(input$editTable == "symptoms", "symptomId", "conditionId"),
+		query <- glue_sql("DELETE FROM diagnosis WHERE {`field`} IN ({vals*})",
+			field = ifelse(input$editType == "symptoms", "symptomId", "conditionId"),
 			vals = input$deleteEntity, .con = db)
 
 		rs_links <- tryCatch(dbExecute(db, query), error = function(e) {
 			sendSweetAlert(session, "Oops", "Unable to delete entry links. Contact for help.", type = "error")
 		})
-		idx <- react_val[["dbChanged"]]$Action == "delete" & react_val[["dbChanged"]]$Entity == input$editTable
+		idx <- react_val[["dbChanged"]]$Action == "delete" & react_val[["dbChanged"]]$Entity == input$editType
 		react_val[["dbChanged"]]$Edits[idx] <- react_val[["dbChanged"]]$Edits[idx] + rs
 	})
 	
 	# 3.  Edit
 	output$changeMenu <- renderUI({
-		selectizeInput("changeEntity", choices = ENTITIES()[[input$editTable]], 
-			label = paste("Select", single(input$editTable)))
+		lab <- paste("Select", single(input$editType))
+		selectInput("changeEntity", label = NULL, choices = c(setNames("", lab), STATES()[[input$editType]]))
 	})
 	
 	output$changeAdd <- renderUI({
 		dropdownButton(icon = icon("plus"),
-			selectizeInput("changeLinks", choices = ENTITIES()[[ otherTable() ]], multiple = TRUE,
-				label = paste("Which", otherTable(), "do you want to add to this", single(input$editTable), "?"))
+			selectizeInput("changeLinks", choices = STATES()[[ otherType() ]], multiple = TRUE,
+				label = paste("Add", otherType(), "to this", single(input$editType), "?"))
 		)
 	})
 	
 	output$changeVis <- renderVisNetwork({
 		react_val$changeVisReset
-		
-		validate(need( !is.null(input$changeEntity), "Must be a real entity."))
-		fields <- c("symptomId", "conditionId")
-		if (input$editTable == "conditions") {
-			fields <- rev(fields)
-		}
-		
-		query <- glue::glue_sql(paste(
-			"SELECT symptomId, conditionId, name FROM symptomCondition", 
-			"LEFT JOIN {`tab`} ON {`otherField`} = id",
-			"WHERE {`mainField`} = {val}"
-		), tab = otherTable(), mainField = fields[1], otherField = fields[2], val = input$changeEntity, .con = db)
+		validate(need( length(input$changeEntity) > 0 && nchar(input$changeEntity) > 0, "Must be a real entity."))
+		query <- glue_sql("SELECT {`mainField`} AS `from`, {`otherField`} AS `to`, name FROM diagnosis", 
+			" LEFT JOIN states ON {`otherField`} = id",
+			" WHERE {`mainField`} = {val}", 
+			mainField = typeFields()[1], otherField = typeFields()[2], val = as.numeric(input$changeEntity), .con = db)
 		dta <- dbGetQuery(db, query)
 		nodes <- bind_rows(
 			data.frame(
-				id    = paste(input$changeEntity, "A"), 
-				label = quickNames(ENTITIES()[[input$editTable]], as.numeric(input$changeEntity), `==`),
-				group = input$editTable),
+				id    = as.numeric(input$changeEntity), 
+				label = quickNames(STATES()[[input$editType]], as.numeric(input$changeEntity), `==`),
+				group = input$editType),
 			data.frame(
-				id    = paste(dta[, fields[2]], "B"),
+				id    = dta$to,
 				label = dta$name,
-				group = otherTable())
+				group = otherType())
 		)
-		dta$from <- paste(dta[, fields[1]], "A")
-		dta$to   <- paste(dta[, fields[2]], "B")
 		visNetwork(nodes, dta) %>% 
 			# visOptions(nodesIdSelection = list(enabled = TRUE, style = "width: 400px; display: none"), 
 			# 	manipulation = TRUE) %>% 
@@ -280,27 +285,26 @@ server <- function(input, output, session) {
 			visGroups(groupname = "conditions", shape = "icon",
 					  icon = list(code = "f21e", color = "#DD4B39")) 
 	})
-	
 	# To 'change' an entity (ie. add or sever edges) there is some promising built in functionality via visOptions for 
 	# selecting nodes and adding edges but there's only so much visNetwork lets me customize the HTML. 
 	# Will return to this later to take advantage of visOptions(), but for now will do my own janky node/edge editing
 	observeEvent(input$changeLinks, {
 		if (is.null(input$changeLinks)) { react_val$changeVisReset <- react_val$changeVisReset + 1}
-		react_val$dbAddLog <- append(react_val$dbAddLog, input$changeLinks)
+		react_val$dbAddLog <- append(react_val$dbAddLog, as.numeric(input$changeLinks))
 		
 		nodes <- data.frame(
-			id     = paste(input$changeLinks, "C"),
-			label  = quickNames(ENTITIES()[[ otherTable() ]], input$changeLinks, `%in%`),
-			group  = otherTable())
+			id     = as.numeric(input$changeLinks),
+			label  = quickNames(STATES()[[ otherType() ]], as.numeric(input$changeLinks), `%in%`),
+			group  = otherType())
 		
 		visNetworkProxy("changeVis", session) %>% 
 			visUpdateNodes(nodes) %>% 
-			visUpdateEdges(data.frame(from = paste(input$changeEntity, "A"), to = nodes$id))
+			visUpdateEdges(data.frame(from = as.numeric(input$changeEntity), to = nodes$id))
 	})
 	
 	observeEvent(input$current_node, {
-		if (input$current_node != paste(input$changeEntity, "A")) {
-			react_val$dbDelLog <- append(react_val$dbDelLog, gsub("([0-9]+)\\s?([A-Z])","\\1", input$current_node))
+		if (input$current_node != as.numeric(input$changeEntity)) {
+			react_val$dbDelLog <- append(react_val$dbDelLog, input$current_node)
 		
 			visNetworkProxy("changeVis", session) %>%
 				visRemoveNodes(input$current_node)
@@ -308,41 +312,35 @@ server <- function(input, output, session) {
 	})
 	
 	observeEvent(input$changeButton, {
-		# My database schema SUCKS. WHy did I separate condition and symptoms into separate tables???
-		# I'm going to have to refactor this whole damn thing later. 
 		changes <- lapply(list(add = react_val$dbAddLog, del = react_val$dbDelLog), function(x) {
-			quickNames(ENTITIES() [[ otherTable() ]], as.numeric(x), `%in%`)
+			quickNames(STATES() [[ otherType() ]], as.numeric(x), `%in%`)
 		})
-		change_name <- quickNames(ENTITIES()[[input$editTable]], as.numeric(input$changeEntity), `==`)
+		change_name <- quickNames(STATES()[[input$editType]], as.numeric(input$changeEntity), `==`)
 
 		confirmSweetAlert(session, "changeConfirm", 
 			title = paste("Verify the changes you want to make to", sQuote(change_name)), 
 			text  = div(style = "text-align: left", 
-				paste(otherTable(), "added:"), tags$ul(lapply(changes$add, tags$li)),
-				paste(otherTable(), "removed:"), tags$ul(lapply(changes$del, tags$li))
+				paste(otherType(), "added:"), tags$ul(lapply(changes$add, tags$li)),
+				paste(otherType(), "removed:"), tags$ul(lapply(changes$del, tags$li))
 			)
 		)
 	})
 	
 	observeEvent(input$changeConfirm, {
 		if (input$changeConfirm) {
-			fields <- c("symptomId", "conditionId")
-			if (input$editTable == "conditions") {
-				fields <- rev(fields)
-			}
 			if (length(react_val$dbDelLog) > 0) {
-				query <- glue::glue_sql(
-					"DELETE FROM symptomCondition WHERE {`mainField`} = {mainVal} AND {`otherField`} IN ({otherVal*})",
-					mainField = fields[1], mainVal = as.numeric(input$changeEntity), otherField = fields[2], 
-					otherVal = as.numeric(react_val$dbDelLog), .con = db)
+				query <- glue_sql(
+					"DELETE FROM diagnosis WHERE {`mainField`} = {mainVal} AND {`otherField`} IN ({otherVal*})",
+					mainField = typeFields()[1], mainVal = as.numeric(input$changeEntity), otherField = typeFields()[2],
+					otherVal = react_val$dbDelLog, .con = db)
 				rs <- dbExecute(db, query)
 			}
 			if (length(react_val$dbAddLog) > 0) {
-				dta <- data.frame(as.numeric(input$changeEntity), as.numeric(react_val$dbAddLog))
-				names(dta) <- fields
-				dbWriteTable(db, "symptomCondition", dta, append = TRUE)
+				dta <- data.frame(as.numeric(input$changeEntity), react_val$dbAddLog)
+				names(dta) <- typeFields
+				dbWriteTable(db, "diagnosis", dta, append = TRUE)
 			}
-			idx <- react_val[["dbChanged"]]$Action == "change" & react_val[["dbChanged"]]$Entity == input$editTable
+			idx <- react_val[["dbChanged"]]$Action == "change" & react_val[["dbChanged"]]$Entity == input$editType
 			react_val[["dbChanged"]]$Edits[idx] <- react_val[["dbChanged"]]$Edits[idx] + 1
 		}
 		react_val$dbAddLog <- react_val$dbDelLog <- NULL
@@ -357,6 +355,11 @@ server <- function(input, output, session) {
 	#########################
 	# Diagnostics
 	#########################
+	output$userPanel <- renderUI({
+		sidebarUserPanel(span("Logged in as: ", USER$name),
+			subtitle = a(icon("sign-out"), "Logout", href = Sys.getenv("DIAGNOSTIC_AUTH0_LOGOUT")))
+	})
+	
 	output$dbEdit <- renderMenu({
 		msgs <- apply( filter(react_val$dbChanged, Edits > 0), 1, function(x) {
 			notificationItem( paste(x["Edits"], x["Entity"], "have been", gsub("e?$", "ed", x["Action"])) )
@@ -365,14 +368,14 @@ server <- function(input, output, session) {
 			badgeStatus = "warning")
 	})
 	output$dbProgress <- renderMenu({
-		total_s <- length(ENTITIES()[["symptoms"]])
-		total_c <- length(ENTITIES()[["conditions"]])
-		bad_s <- dbGetQuery(db, paste("SELECT COUNT(*) AS c FROM symptoms",
-												"LEFT JOIN symptomCondition ON id = symptomId",
-												"WHERE symptomId IS NULL"))
-		bad_c <- dbGetQuery(db, paste("SELECT COUNT(*) AS c FROM conditions",
-												"LEFT JOIN symptomCondition ON id = conditionId",
-												"WHERE conditionId IS NULL"))
+		total_s <- length(STATES()[["symptoms"]])
+		total_c <- length(STATES()[["conditions"]])
+		bad_s <- dbGetQuery(db, glue_sql("SELECT COUNT(*) AS c FROM states",
+			" LEFT JOIN diagnosis ON id = symptomId",
+			" WHERE userId = {user} AND symptomId IS NULL", user = USER$id, .con = db))
+		bad_c <- dbGetQuery(db, glue_sql("SELECT COUNT(*) AS c FROM states",
+			" LEFT JOIN diagnosis ON id = conditionId",
+			" WHERE userId = {user} AND conditionId IS NULL", user = USER$id, .con = db))
 		msgs <- list(
 			taskItem("Register at least 15 conditions",        round(100 * total_s / 15), color = "red"),
 			taskItem("Register at least 30 symptoms",          round(100 * total_c / 30), color = "aqua"),
@@ -383,10 +386,10 @@ server <- function(input, output, session) {
 	})
 	
 	output$n_symptom <- renderValueBox({
-		valueBox( length(ENTITIES()[["symptoms"]]), "registered symptoms", icon("stethoscope"), color = "teal")
+		valueBox( length(STATES()[["symptoms"]]), "registered symptoms", icon("stethoscope"), color = "teal")
 	})
 	output$n_condition <- renderValueBox({
-		valueBox( length(ENTITIES()[["conditions"]]), "registered conditions", icon("heartbeat"), color = "red")
+		valueBox( length(STATES()[["conditions"]]), "registered conditions", icon("heartbeat"), color = "red")
 	})
 	
 	output$inn <- renderPrint({

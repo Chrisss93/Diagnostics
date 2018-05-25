@@ -3,8 +3,7 @@ library(shinydashboard)
 library(shinyWidgets)
 
 sidebar <- dashboardSidebar(
-	sidebarUserPanel(paste("Logged in as:", USER$name),
-		subtitle = a(icon("sign-out"), "Logout", href = Sys.getenv("DIAGNOSTIC_AUTH0_LOGOUT"))),
+	uiOutput("userPanel"),
 	sidebarMenu(
 		menuItem("Dashboard", tabName = "dashboard", icon = icon("dashboard"), badgeLabel = "new", badgeColor = "green"),
 		menuItem("Edit database", tabName = "database", icon = icon("database"), badgeLabel = "new", badgeColor = "green"),
@@ -40,7 +39,7 @@ body <- dashboardBody(
 			fluidRow(
 				box(width = 12, status = "danger", solidHeader = TRUE, collapsible = TRUE, title = "Edit database",
 					column(width = 4,
-						prettyRadioButtons("editTable", choiceValues = ENTITY_FIELDS, animation = "pulse",
+						prettyRadioButtons("editType", choiceValues = ENTITY_FIELDS, animation = "pulse",
 							choiceNames = capitalize(ENTITY_FIELDS), label = "Entity", status = "info"),
 						prettyRadioButtons("editAction", choiceValues = EDIT_FIELDS, animation = "pulse",
 							choiceNames = capitalize(EDIT_FIELDS), label = "Action", status = "info")),
